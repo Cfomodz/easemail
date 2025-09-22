@@ -1,4 +1,14 @@
-# 🧠 Intelligent Email Triage System
+<div align="center">
+
+<img src="docs/easemail.png" alt="easemail" width="400"/>
+
+![GitHub License](https://img.shields.io/github/license/Cfomodz/easemail)
+![Discord](https://img.shields.io/discord/425182625032962049)
+![GitHub Sponsors](https://img.shields.io/github/sponsors/Cfomodz)
+
+### 🧠 Intelligent Email Triage System
+
+</div>
 
 An AI-powered email management system that helps you process thousands of emails efficiently with smart batch processing, voice feedback, and automated actions.
 
