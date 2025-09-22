@@ -1,0 +1,16 @@
+{
+    "openai_api_key": "your-openai-api-key-here",
+    "elevenlabs_api_key": "your-elevenlabs-api-key-here",
+    "elevenlabs_voice_id": "Z9hrfEHGU3dykHntWvIY",
+    "elevenlabs_model": "eleven_flash_v2_5",
+    "tts_provider": "elevenlabs",
+    "confidence_threshold": 0.7,
+    "batch_size": 5,
+    "auto_process_threshold": 0.8,
+    "opt_out_grace_period_days": 7,
+    "max_emails_per_session": 50,
+    "enable_voice": true,
+    "enable_interruption": true,
+    "voice_speed": 1.0,
+    "debug_mode": false
+}

@@ -1,0 +1,19 @@
+# Email Triage System Requirements
+
+# Core dependencies
+openai>=1.0.0              # For AI-powered email classification
+pyttsx3>=2.90              # Text-to-speech functionality
+requests>=2.31.0           # For unsubscribe automation
+
+# Optional but recommended
+python-dateutil>=2.8.2     # Better date parsing
+sqlite3                    # Built into Python, for preference storage
+
+# Development/Testing
+pytest>=7.0.0              # For running tests
+black>=23.0.0              # Code formatting
+flake8>=6.0.0              # Linting
+
+# Additional optional dependencies
+# For enhanced features, you may want to install:
+# - Additional TTS engines (Azure Speech, AWS Polly)
