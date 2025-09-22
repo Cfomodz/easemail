@@ -164,6 +164,9 @@ class EmailTriageSystem:
             'trash': 0,
             'revisit': 0,
             'action_needed': 0,
+            'opt_out': 0,
+            'spam': 0,
+            'bulk_archive': 0,
             'auto_decided': 0
         }
     
@@ -574,9 +577,37 @@ Respond with JSON:
                     confidence_levels["medium"] += 1
             
             print(f"\n🤖 {len(auto_decisions)} emails ready for auto-processing:")
+            print()
+            
+            # Voice prompt for auto-decisions
+            if self.config.get('enable_tts', True):
+                actions_summary = {}
+                for email, decision in auto_decisions:
+                    action = decision.action.replace('_', ' ')
+                    if action not in actions_summary:
+                        actions_summary[action] = 0
+                    actions_summary[action] += 1
+                
+                # Create voice prompt
+                voice_text = f"{len(auto_decisions)} suggested actions ready. "
+                action_parts = []
+                for action, count in actions_summary.items():
+                    action_parts.append(f"{count} to {action}")
+                voice_text += ", ".join(action_parts) + ". Please review and confirm."
+                
+                self.speak_async(voice_text)
+            
+            # Show individual emails with intended actions
+            action_icons = {"trash": "🗑️", "revisit": "⏰", "action_needed": "⚡", "opt_out": "🚫", "spam": "🚯", "bulk_archive": "📚"}
+            for email, decision in auto_decisions:
+                action_name = decision.action.replace('_', ' ').title()
+                icon = action_icons.get(decision.action, "📧")
+                sender_display = email.sender[:40] + "..." if len(email.sender) > 40 else email.sender
+                subject_display = email.subject[:50] + "..." if len(email.subject) > 50 else email.subject
+                print(f"  {icon} {action_name} | {sender_display} | {subject_display}")
             
             # Show summary by action
-            action_icons = {"trash": "🗑️", "revisit": "⏰", "action_needed": "⚡"}
+            print(f"\n📊 Summary:")
             for action, items in action_summary.items():
                 action_name = action.replace('_', ' ').title()
                 icon = action_icons.get(action, "📧")
@@ -807,6 +838,12 @@ Respond with JSON:
         print(f"🗑️  Trash/Archive: {stats['trash']}")
         print(f"⏰ Revisit later: {stats['revisit']}")
         print(f"⚡ Action needed: {stats['action_needed']}")
+        if stats['opt_out'] > 0:
+            print(f"🚫 Opt-out requests: {stats['opt_out']}")
+        if stats['spam'] > 0:
+            print(f"🚯 Marked as spam: {stats['spam']}")
+        if stats['bulk_archive'] > 0:
+            print(f"📚 Bulk archived: {stats['bulk_archive']}")
         print(f"🤖 Auto-decided: {stats['auto_decided']}")
         
         if stats['processed'] > 0:

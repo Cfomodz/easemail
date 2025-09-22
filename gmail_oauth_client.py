@@ -738,6 +738,35 @@ class SimpleGmailTriageConnector:
         # Handle auto-decisions (same as normal process_batch)
         if auto_decisions:
             print(f"\n🤖 {len(auto_decisions)} emails ready for auto-processing (pre-classified):")
+            print()
+            
+            # Voice prompt for auto-decisions
+            if self.triage_system.config.get('enable_tts', True):
+                actions_summary = {}
+                for email, decision in auto_decisions:
+                    action = decision.action.replace('_', ' ')
+                    if action not in actions_summary:
+                        actions_summary[action] = 0
+                    actions_summary[action] += 1
+                
+                # Create voice prompt
+                voice_text = f"{len(auto_decisions)} pre-classified actions ready. "
+                action_parts = []
+                for action, count in actions_summary.items():
+                    action_parts.append(f"{count} to {action}")
+                voice_text += ", ".join(action_parts) + ". Please review and confirm."
+                
+                self.triage_system.speak_async(voice_text)
+            
+            # Show individual emails with intended actions
+            action_icons = {"trash": "🗑️", "revisit": "⏰", "action_needed": "⚡", "opt_out": "🚫", "spam": "🚯", "bulk_archive": "📚"}
+            for email, decision in auto_decisions:
+                action_name = decision.action.replace('_', ' ').title()
+                icon = action_icons.get(decision.action, "📧")
+                sender_display = email.sender[:40] + "..." if len(email.sender) > 40 else email.sender
+                subject_display = email.subject[:50] + "..." if len(email.subject) > 50 else email.subject
+                print(f"  {icon} {action_name} | {sender_display} | {subject_display}")
+            
             # Show summary
             action_summary = {}
             for email, decision in auto_decisions:
@@ -746,7 +775,7 @@ class SimpleGmailTriageConnector:
                     action_summary[action] = 0
                 action_summary[action] += 1
             
-            action_icons = {"trash": "🗑️", "revisit": "⏰", "action_needed": "⚡"}
+            print(f"\n📊 Summary:")
             for action, count in action_summary.items():
                 action_name = action.replace('_', ' ').title()
                 icon = action_icons.get(action, "📧")
@@ -758,7 +787,8 @@ class SimpleGmailTriageConnector:
                 for email, decision in auto_decisions:
                     self.triage_system.learn_from_decision(email, decision, False)
                     self.triage_system.session_stats[decision.action] += 1
-                    results.extend(auto_decisions)
+                # Add all auto-decisions to results (outside the loop!)
+                results.extend(auto_decisions)
                 print(f"✅ Applied {len(auto_decisions)} auto-decisions")
             else:
                 manual_decisions.extend(auto_decisions)
