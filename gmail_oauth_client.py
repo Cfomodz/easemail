@@ -7,8 +7,11 @@ Simple, direct integration with Gmail API using OAuth
 import json
 import os
 import pickle
+import threading
+import queue
+import time
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 # Gmail API imports
@@ -251,14 +254,42 @@ class SimpleGmailTriageConnector:
         # Create labels if needed
         self.gmail_client.create_labels_if_needed()
         
-        # Label mappings
-        self.labels = {
-            'trash': 'TRASH',
-            'revisit': 'TRIAGE_REVISIT',
-            'action_needed': 'TRIAGE_ACTION_NEEDED',
-            'spam': 'SPAM',
-            'opt_out': 'TRIAGE_OPT_OUT'
-        }
+        # Get label IDs for our custom labels
+        self._initialize_label_mappings()
+        
+        # Smart batching state
+        self.email_queue = queue.Queue()
+        self.processed_batches = []
+        self.background_thread = None
+        self.stop_background_processing = False
+    
+    def _initialize_label_mappings(self):
+        """Initialize label mappings with actual Gmail label IDs"""
+        try:
+            # Get existing labels
+            labels_result = self.gmail_client.service.users().labels().list(userId='me').execute()
+            existing_labels = {label['name']: label['id'] for label in labels_result.get('labels', [])}
+            
+            # Label mappings using actual IDs
+            self.labels = {
+                'trash': 'TRASH',  # Built-in Gmail label
+                'revisit': existing_labels.get('TRIAGE_REVISIT', 'TRIAGE_REVISIT'),
+                'action_needed': existing_labels.get('TRIAGE_ACTION_NEEDED', 'TRIAGE_ACTION_NEEDED'),
+                'spam': 'SPAM',  # Built-in Gmail label
+                'opt_out': existing_labels.get('TRIAGE_OPT_OUT', 'TRIAGE_OPT_OUT')
+            }
+            print(f"📋 Initialized label mappings: {len(self.labels)} labels")
+            
+        except Exception as e:
+            print(f"⚠️  Error initializing label mappings: {e}")
+            # Fallback to label names
+            self.labels = {
+                'trash': 'TRASH',
+                'revisit': 'TRIAGE_REVISIT',
+                'action_needed': 'TRIAGE_ACTION_NEEDED',
+                'spam': 'SPAM',
+                'opt_out': 'TRIAGE_OPT_OUT'
+            }
     
     def gmail_to_email_item(self, message_data: Dict) -> EmailItem:
         """Convert Gmail message to EmailItem"""
@@ -382,18 +413,32 @@ class SimpleGmailTriageConnector:
                 # Parse the draft info (simplified parsing)
                 print(f"🚫 Creating data erasure draft for: {email_item.sender}")
                 
-                # For now, just archive and add opt-out label
+                # Verify we have the opt_out label
+                opt_out_label = self.labels.get('opt_out')
+                if not opt_out_label:
+                    print(f"⚠️  Warning: opt_out label not found, using fallback")
+                    opt_out_label = 'TRIAGE_OPT_OUT'
+                
+                # Archive and add opt-out label
                 # TODO: Implement actual draft creation via Gmail API
                 self.gmail_client.modify_message(
                     email_item.id,
-                    add_labels=[self.labels['opt_out']],
+                    add_labels=[opt_out_label],
                     remove_labels=['INBOX']
                 )
                 print(f"📧 Opt-out processed: {email_item.subject[:50]}...")
                 print(f"💡 Draft creation would be implemented here")
+            else:
+                print(f"⚠️  Warning: No opt-out data found in decision, archiving only")
+                self.gmail_client.modify_message(
+                    email_item.id,
+                    remove_labels=['INBOX']
+                )
             
         except Exception as e:
-            print(f"❌ Error handling opt-out: {e}")
+            print(f"❌ Error handling opt-out for {email_item.sender}: {e}")
+            import traceback
+            print(f"📋 Full error details: {traceback.format_exc()}")
     
     def _handle_spam_action(self, email_item: EmailItem, decision: TriageDecision):
         """Handle spam action for repeat offenders"""
@@ -447,27 +492,286 @@ class SimpleGmailTriageConnector:
         except Exception as e:
             print(f"❌ Error handling bulk archive: {e}")
     
+    def _background_batch_processor(self, emails: List[EmailItem], start_index: int, batch_size: int):
+        """Background thread to pre-process next batches"""
+        try:
+            current_index = start_index
+            while current_index < len(emails) and not self.stop_background_processing:
+                # Process next batch
+                end_index = min(current_index + batch_size, len(emails))
+                batch = emails[current_index:end_index]
+                
+                if not batch:
+                    break
+                
+                print(f"🔄 Background processing batch {current_index//batch_size + 1} ({len(batch)} emails)...")
+                
+                # Process the batch (AI classification)
+                processed_decisions = []
+                for email in batch:
+                    if self.stop_background_processing:
+                        break
+                    decision = self.triage_system.classify_email_ai(email)
+                    processed_decisions.append((email, decision))
+                
+                # Store the processed batch
+                if not self.stop_background_processing:
+                    self.processed_batches.append({
+                        'batch_index': current_index // batch_size,
+                        'decisions': processed_decisions,
+                        'ready': True
+                    })
+                    print(f"✅ Background batch {current_index//batch_size + 1} ready ({len(processed_decisions)} emails)")
+                
+                current_index += batch_size
+                
+        except Exception as e:
+            print(f"❌ Background processing error: {e}")
+    
+    def _get_batch_sizes(self, user_batch_size: Optional[int] = None) -> Tuple[int, int]:
+        """Get fetch and process batch sizes from config and user input"""
+        config = self.triage_system.config
+        
+        # Process batch size (what user works on at once)
+        process_batch_size = user_batch_size or config.get('batch_size', 5)
+        
+        # Fetch batch size (how many to fetch from Gmail at once)
+        config_fetch_size = config.get('fetch_batch_size', 20)
+        fetch_batch_size = max(config_fetch_size, process_batch_size)
+        
+        return fetch_batch_size, process_batch_size
+    
     def run_triage_session(self, batch_size: int = 5):
-        """Run a complete triage session"""
+        """Run a complete triage session with smart batching"""
         print("🚀 Starting Gmail Triage Session")
         print("="*60)
         
-        # Fetch emails
-        emails = self.fetch_inbox_emails(batch_size)
+        # Get batch sizes
+        fetch_batch_size, process_batch_size = self._get_batch_sizes(batch_size)
         
-        if not emails:
-            print("📭 No emails to process!")
-            return
+        # Check if smart batching is enabled
+        config = self.triage_system.config
+        smart_batching_enabled = config.get('enable_smart_batching', True)
+        preprocess_enabled = config.get('preprocess_next_batch', True)
         
-        # Process with triage system
-        decisions = self.triage_system.process_batch(emails)
+        if smart_batching_enabled:
+            print(f"🧠 Smart batching enabled: fetching {fetch_batch_size}, processing {process_batch_size} at a time")
+            self._run_smart_triage_session(fetch_batch_size, process_batch_size, preprocess_enabled)
+        else:
+            print(f"📧 Standard batching: processing {process_batch_size} emails")
+            self._run_standard_triage_session(process_batch_size)
+    
+    def _run_standard_triage_session(self, batch_size: int):
+        """Run standard triage session with continuous processing"""
+        try:
+            session_total_processed = 0
+            
+            print(f"🔄 Starting continuous email processing...")
+            print(f"📧 Will process {batch_size} emails at a time")
+            print(f"💡 Press Ctrl+C anytime to stop and return to main menu")
+            print()
+            
+            while True:
+                # Fetch emails
+                print(f"📥 Fetching up to {batch_size} emails from inbox...")
+                emails = self.fetch_inbox_emails(batch_size)
+                
+                if not emails:
+                    print("📭 No more emails to process!")
+                    break
+                
+                print(f"📧 Found {len(emails)} emails to process")
+                
+                # Process with triage system
+                decisions = self.triage_system.process_batch(emails)
+                
+                # Apply decisions to Gmail
+                if decisions:
+                    self.apply_triage_decisions(decisions)
+                
+                session_total_processed += len(emails)
+                
+                # Show session progress
+                print(f"\n✅ Completed processing {len(emails)} emails")
+                print(f"📊 Session total: {session_total_processed} emails processed")
+                
+                # Brief pause before fetching next batch
+                print(f"\n⏳ Checking for more emails...")
+                time.sleep(1)
+            
+            # Print final session stats
+            print(f"\n🎉 Session complete! Processed {session_total_processed} emails total.")
+            self.triage_system.print_session_stats()
+            
+        except KeyboardInterrupt:
+            print(f"\n🛑 Session stopped by user after processing {session_total_processed} emails")
+            self.triage_system.print_session_stats()
+    
+    def _run_smart_triage_session(self, fetch_batch_size: int, process_batch_size: int, preprocess_enabled: bool):
+        """Run smart triage session with continuous processing"""
+        try:
+            session_total_processed = 0
+            
+            print(f"🔄 Starting continuous email processing...")
+            print(f"📧 Will fetch {fetch_batch_size} emails at a time, process in batches of {process_batch_size}")
+            print(f"💡 Press Ctrl+C anytime to stop and return to main menu")
+            print()
+            
+            while True:
+                # Fetch next batch of emails
+                print(f"📥 Fetching up to {fetch_batch_size} emails from inbox...")
+                all_emails = self.fetch_inbox_emails(fetch_batch_size)
+                
+                if not all_emails:
+                    print("📭 No more emails to process!")
+                    break
+                
+                print(f"📧 Found {len(all_emails)} emails to process in batches of {process_batch_size}")
+                
+                # Initialize batch processing for this fetch
+                self.processed_batches = []
+                self.stop_background_processing = False
+                
+                # Start background processing for remaining batches if enabled and there are more emails
+                if preprocess_enabled and len(all_emails) > process_batch_size:
+                    print(f"🚀 Starting background processing for remaining batches...")
+                    self.background_thread = threading.Thread(
+                        target=self._background_batch_processor,
+                        args=(all_emails, process_batch_size, process_batch_size),
+                        daemon=True
+                    )
+                    self.background_thread.start()
+                
+                # Process batches sequentially for user interaction
+                processed_count = 0
+                batch_number = 1
+                total_batches = (len(all_emails) + process_batch_size - 1) // process_batch_size
+                
+                while processed_count < len(all_emails):
+                    # Get current batch
+                    start_idx = processed_count
+                    end_idx = min(start_idx + process_batch_size, len(all_emails))
+                    current_batch = all_emails[start_idx:end_idx]
+                    
+                    print(f"\n🔄 Processing batch {batch_number}/{total_batches} ({len(current_batch)} emails)...")
+                    
+                    if batch_number == 1:
+                        # First batch - process normally
+                        decisions = self.triage_system.process_batch(current_batch)
+                    else:
+                        # Check if background processing has this batch ready
+                        batch_ready = False
+                        pre_processed_decisions = None
+                        
+                        # Look for pre-processed batch
+                        for processed_batch in self.processed_batches:
+                            if processed_batch['batch_index'] == batch_number - 1 and processed_batch['ready']:
+                                pre_processed_decisions = processed_batch['decisions']
+                                batch_ready = True
+                                print(f"⚡ Using pre-processed batch {batch_number} (AI classification ready!)")
+                                break
+                        
+                        if batch_ready and pre_processed_decisions:
+                            # Use pre-processed decisions and just handle user interaction
+                            decisions = self._handle_preprocessed_batch(pre_processed_decisions)
+                        else:
+                            # Fallback to normal processing
+                            print(f"🔄 Processing batch {batch_number} normally...")
+                            decisions = self.triage_system.process_batch(current_batch)
+                    
+                    # Apply decisions to Gmail
+                    if decisions:
+                        self.apply_triage_decisions(decisions)
+                    
+                    processed_count += len(current_batch)
+                    session_total_processed += len(current_batch)
+                    batch_number += 1
+                    
+                    # Show progress within this fetch batch
+                    remaining_in_fetch = len(all_emails) - processed_count
+                    if remaining_in_fetch > 0:
+                        print(f"\n📊 Batch {batch_number-1} complete. {remaining_in_fetch} emails remaining in this fetch...")
+                        time.sleep(0.5)  # Brief pause for user experience
+                
+                # Clean up background processing for this fetch
+                self.stop_background_processing = True
+                if self.background_thread and self.background_thread.is_alive():
+                    self.background_thread.join(timeout=2)
+                
+                # Show session progress
+                print(f"\n✅ Completed processing {len(all_emails)} emails from this fetch")
+                print(f"📊 Session total: {session_total_processed} emails processed")
+                
+                # Brief pause before fetching next batch
+                print(f"\n⏳ Checking for more emails...")
+                time.sleep(1)
+            
+            # Print final session stats
+            print(f"\n🎉 Session complete! Processed {session_total_processed} emails total.")
+            self.triage_system.print_session_stats()
+            
+        except KeyboardInterrupt:
+            print(f"\n🛑 Session stopped by user after processing {session_total_processed} emails")
+            self.stop_background_processing = True
+            if hasattr(self, 'background_thread') and self.background_thread and self.background_thread.is_alive():
+                self.background_thread.join(timeout=2)
+            self.triage_system.print_session_stats()
+        except Exception as e:
+            print(f"❌ Error in smart triage session: {e}")
+            self.stop_background_processing = True
+            if hasattr(self, 'background_thread') and self.background_thread and self.background_thread.is_alive():
+                self.background_thread.join(timeout=2)
+    
+    def _handle_preprocessed_batch(self, pre_processed_decisions: List[Tuple]) -> List[Tuple]:
+        """Handle a batch that was pre-processed in the background"""
+        results = []
+        auto_decisions = []
+        manual_decisions = []
         
-        # Apply decisions to Gmail
-        if decisions:
-            self.apply_triage_decisions(decisions)
+        # Separate auto vs manual decisions
+        for email, decision in pre_processed_decisions:
+            if decision.confidence >= self.triage_system.config.get('auto_decide_threshold', 0.85):
+                auto_decisions.append((email, decision))
+            else:
+                manual_decisions.append((email, decision))
         
-        # Print final stats
-        self.triage_system.print_session_stats()
+        # Handle auto-decisions (same as normal process_batch)
+        if auto_decisions:
+            print(f"\n🤖 {len(auto_decisions)} emails ready for auto-processing (pre-classified):")
+            # Show summary
+            action_summary = {}
+            for email, decision in auto_decisions:
+                action = decision.action
+                if action not in action_summary:
+                    action_summary[action] = 0
+                action_summary[action] += 1
+            
+            action_icons = {"trash": "🗑️", "revisit": "⏰", "action_needed": "⚡"}
+            for action, count in action_summary.items():
+                action_name = action.replace('_', ' ').title()
+                icon = action_icons.get(action, "📧")
+                print(f"  {icon} {count} emails → {action_name}")
+            
+            # Get user confirmation for auto-decisions
+            confirm = input(f"\n⚡ Auto-apply these {len(auto_decisions)} decisions? [Y/n]: ").strip().lower()
+            if confirm != 'n':
+                for email, decision in auto_decisions:
+                    self.triage_system.learn_from_decision(email, decision, False)
+                    self.triage_system.session_stats[decision.action] += 1
+                    results.extend(auto_decisions)
+                print(f"✅ Applied {len(auto_decisions)} auto-decisions")
+            else:
+                manual_decisions.extend(auto_decisions)
+        
+        # Handle manual decisions
+        for email, decision in manual_decisions:
+            confirmed_decision = self.triage_system.get_user_decision(email, decision)
+            if confirmed_decision:
+                self.triage_system.learn_from_decision(email, confirmed_decision, True)
+                self.triage_system.session_stats[confirmed_decision.action] += 1
+                results.append((email, confirmed_decision))
+        
+        return results
 
 
 def main():

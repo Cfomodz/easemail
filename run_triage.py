@@ -52,8 +52,9 @@ def show_menu():
     print("2. ⚙️  Setup/Configuration")
     print("3. 📊 View Statistics")
     print("4. 🔧 Manage Preferences")
-    print("5. ❓ Help")
-    print("6. 🚪 Exit")
+    print("5. 🧠 Smart Batching Settings")
+    print("6. ❓ Help")
+    print("7. 🚪 Exit")
     print("="*60)
 
 def run_gmail_triage():
@@ -63,7 +64,21 @@ def run_gmail_triage():
         from gmail_oauth_client import SimpleGmailTriageConnector
         connector = SimpleGmailTriageConnector()
         
-        batch_size = int(input("Batch size (default 5): ") or "5")
+        # Get default batch size from config
+        config = connector.triage_system.config
+        default_batch_size = config.get('batch_size', 5)
+        default_fetch_size = config.get('fetch_batch_size', 20)
+        smart_batching = config.get('enable_smart_batching', True)
+        
+        print(f"📧 Current settings:")
+        print(f"  • Process batch size: {default_batch_size}")
+        print(f"  • Fetch batch size: {default_fetch_size}")
+        print(f"  • Smart batching: {'✅ Enabled' if smart_batching else '❌ Disabled'}")
+        print()
+        
+        batch_size_input = input(f"Process batch size (default {default_batch_size}): ").strip()
+        batch_size = int(batch_size_input) if batch_size_input else default_batch_size
+        
         connector.run_triage_session(batch_size)
     except ImportError as e:
         print(f"❌ Import error: {e}")
@@ -218,6 +233,137 @@ def add_manual_preference():
     except Exception as e:
         print(f"❌ Error: {e}")
 
+def delete_preference():
+    """Delete a preference"""
+    try:
+        from email_triage_system import EmailTriageSystem
+        import sqlite3
+        
+        triage = EmailTriageSystem()
+        conn = sqlite3.connect(triage.db_path)
+        cursor = conn.cursor()
+        
+        # Show all preferences
+        cursor.execute("""
+            SELECT id, pattern_type, pattern_value, action, confidence, usage_count 
+            FROM preferences 
+            ORDER BY id
+        """)
+        
+        preferences = cursor.fetchall()
+        if not preferences:
+            print("📭 No preferences found")
+            conn.close()
+            return
+        
+        print("\n📋 Current Preferences:")
+        for row in preferences:
+            id_, pattern_type, pattern_value, action, confidence, usage_count = row
+            print(f"  [{id_}] {pattern_type}:{pattern_value} → {action} (conf: {confidence:.2f}, used: {usage_count}x)")
+        
+        pref_id = input("\nEnter preference ID to delete: ").strip()
+        if not pref_id.isdigit():
+            print("❌ Invalid ID")
+            conn.close()
+            return
+        
+        # Delete preference
+        cursor.execute("DELETE FROM preferences WHERE id = ?", (int(pref_id),))
+        
+        if cursor.rowcount > 0:
+            conn.commit()
+            print(f"✅ Deleted preference {pref_id}")
+        else:
+            print(f"❌ Preference {pref_id} not found")
+        
+        conn.close()
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+def manage_smart_batching():
+    """Manage smart batching settings"""
+    print("🧠 Smart Batching Settings")
+    print("="*50)
+    
+    try:
+        import json
+        from pathlib import Path
+        
+        config_file = Path("./triage_data/config.json")
+        if not config_file.exists():
+            print("❌ Config file not found. Please run setup first.")
+            return
+        
+        # Load current config
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # Show current settings
+        print("📧 Current Smart Batching Settings:")
+        print(f"  • Process batch size: {config.get('batch_size', 5)}")
+        print(f"  • Fetch batch size: {config.get('fetch_batch_size', 20)}")
+        print(f"  • Smart batching enabled: {config.get('enable_smart_batching', True)}")
+        print(f"  • Background preprocessing: {config.get('preprocess_next_batch', True)}")
+        print()
+        
+        # Menu options
+        print("Options:")
+        print("1. Toggle smart batching on/off")
+        print("2. Change process batch size")
+        print("3. Change fetch batch size")
+        print("4. Toggle background preprocessing")
+        print("5. Back to main menu")
+        
+        choice = input("Choice: ").strip()
+        
+        if choice == "1":
+            current = config.get('enable_smart_batching', True)
+            config['enable_smart_batching'] = not current
+            status = "enabled" if not current else "disabled"
+            print(f"✅ Smart batching {status}")
+            
+        elif choice == "2":
+            current = config.get('batch_size', 5)
+            new_size = input(f"New process batch size (current: {current}): ").strip()
+            if new_size.isdigit() and int(new_size) > 0:
+                config['batch_size'] = int(new_size)
+                print(f"✅ Process batch size set to {new_size}")
+            else:
+                print("❌ Invalid batch size")
+                return
+                
+        elif choice == "3":
+            current = config.get('fetch_batch_size', 20)
+            new_size = input(f"New fetch batch size (current: {current}): ").strip()
+            if new_size.isdigit() and int(new_size) > 0:
+                config['fetch_batch_size'] = int(new_size)
+                print(f"✅ Fetch batch size set to {new_size}")
+            else:
+                print("❌ Invalid batch size")
+                return
+                
+        elif choice == "4":
+            current = config.get('preprocess_next_batch', True)
+            config['preprocess_next_batch'] = not current
+            status = "enabled" if not current else "disabled"
+            print(f"✅ Background preprocessing {status}")
+            
+        elif choice == "5":
+            return
+        else:
+            print("❌ Invalid choice")
+            return
+        
+        # Save updated config
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=4)
+        
+        print("💾 Settings saved!")
+        
+    except Exception as e:
+        print(f"❌ Error managing settings: {e}")
+
 def show_help():
     """Show help"""
     print("\n❓ HELP")
@@ -225,11 +371,19 @@ def show_help():
     print("📧 Email Triage System helps you process large volumes of emails efficiently.")
     print()
     print("🎯 How it works:")
-    print("1. Fetches emails from your inbox")
+    print("1. Continuously fetches emails from your inbox")
     print("2. AI classifies each email into 3 categories")
     print("3. High-confidence decisions are auto-applied")
     print("4. Uncertain cases require your yes/no decision")
     print("5. System learns from your choices")
+    print("6. Automatically fetches more emails when done")
+    print("7. Continues until you press Ctrl+C or no more emails")
+    print()
+    print("🧠 Smart Batching:")
+    print("- Fetches large batches (default: 20 emails)")
+    print("- Processes in smaller chunks (default: 5 emails)")
+    print("- Pre-processes next batch while you work")
+    print("- Seamless transition between batches")
     print()
     print("🔧 Setup Requirements:")
     print("- OpenAI API key (optional, improves accuracy)")
@@ -259,8 +413,10 @@ def main():
         elif choice == "4":
             manage_preferences()
         elif choice == "5":
-            show_help()
+            manage_smart_batching()
         elif choice == "6":
+            show_help()
+        elif choice == "7":
             print("👋 Goodbye!")
             sys.exit(0)
         else:
